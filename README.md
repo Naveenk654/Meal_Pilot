@@ -2,11 +2,56 @@
 
 Agentic AI Mess & Meal Planning System for LNMIIT students. Architecture is **frozen at v3** — see `PROJECT_PLAN.md` and `DECISIONS.md`.
 
-Current status: **M1 complete.** Foundations, deterministic nutrition, DB schema + RLS, LLM router, trace writers, idempotency infra, FastAPI onboarding, Streamlit shell. Ready to connect to a real Supabase project and start M2 (Menu Intelligence + macro DB).
+**Live app:** <https://mealpilot-lnmiit.streamlit.app/> · **API docs:** <https://mealpilot-production.up.railway.app/docs>
+
+## What it does
+
+Given a hostel mess menu (uploaded as PDF), a student's onboarding profile (age / weight / activity / goal / dietary preferences / budget), and any canteen items they'd allow, the system:
+
+1. **Ingests the menu** — parses PDF, LLM-extracts dish structure, estimates per-serving macros, admin-verifies before it's live (`menu_intel` agent).
+2. **Plans the day** — a LangGraph state machine drafts a plan, deterministic constraint engine validates it against allergies / restrictions / budget / practical serving caps, revises with LLM feedback if needed, commits with a confidence score (`planner` agent).
+3. **Tracks meals** — three-button log per meal (`ate planned` / `ate different` / `skipped`). Mid-day replan on divergence; no replan on the golden path.
+4. **Fills the gap** — after dinner, if macros are short, suggests canteen add-ons that close the gap within budget (deterministic top-up, no LLM).
+5. **Learns preferences** — weekly Learning Agent proposes behavioral facts ("skips peanut butter at breakfast") from meal-log patterns; user approves/rejects via HITL.
+
+## Status
+
+- ✅ **M1 — Foundations:** FastAPI + Supabase RLS + auth + onboarding + nutrition + LLM router + observability tables.
+- ✅ **M2 — Menu Intelligence:** PDF ingestion, LLM extraction, macro DB, admin console (upload/approve/verify).
+- ✅ **M3 — Planner Agent:** LangGraph state machine, deterministic constraint engine, confidence calculator, plan lifecycle (`draft → sent → superseded`).
+- ✅ **M4 — Meal Logging:** append-only logs, idempotent writes, macro tracker, mid-day replan.
+- ✅ **M5 (partial) — Canteen top-up + HITL surfaces:** deterministic gap-fill, HITL memory review, mixed-mode planning.
+- 140/140 tests passing on the current main.
+
+## Architecture — one line each
+
+- **Three agents:** Planner (LangGraph), Menu Intelligence (PDF → macros), Profile & Learning (weekly).
+- **Everything else is a tool, not an agent:** nutrition math, constraint engine, canteen picker, confidence, memory.
+- **Deterministic Python for every number.** LLMs propose; Python validates and computes. Constraint engine has final say before commit.
+- **Append-only meal_logs, idempotent writes** (client `event_id` = unique constraint), version-guarded plan writes to survive concurrent replans.
+
+## Stack
+
+Python 3.11 · FastAPI · LangGraph · Streamlit · Supabase (Postgres + Auth + RLS) · Gemini Flash (primary LLM) + Groq Llama 3.1 (fallback) · pdfplumber · Railway (backend) + Streamlit Community Cloud (frontend).
 
 ---
 
-## 0. Requirements
+## Try it live
+
+The deployed app runs on Supabase free tier — if the project has been idle for a week it pauses; give it 2 minutes to wake on the first magic-link sign-in.
+
+1. Open <https://mealpilot-lnmiit.streamlit.app/>
+2. Enter your email → click **Send magic link**.
+3. Click the link in your email. You land back signed in.
+4. Fill the onboarding form (age, gender, weight, goal, dislikes, budget). BMR/TDEE/macro targets compute deterministically from Mifflin-St Jeor.
+5. On the Today tab, click **Generate / refresh plan** — the planner picks meals from the currently active mess menu that hit your macros.
+6. Use the three-button meal log to record what you actually ate. Watch the plan card / macro tracker update.
+
+Admin-only bits (menu PDF upload, macro verification) require `role = 'admin'` on your `public.users` row.
+
+---
+
+## 0. Local development — requirements
 
 - Python **3.11**
 - A Supabase project (free tier) — created in §2
@@ -140,22 +185,15 @@ That's the M1 end-to-end loop.
 
 ---
 
-## 8. Deploy to Railway (later)
+## 8. Deploy
 
-Deferred — do when ready.
+The project is deployed as two services connecting to one Supabase project:
 
-```powershell
-# one-time
-npm i -g @railway/cli
-railway login
+- **Backend (FastAPI)** → Railway. Start command is in `Procfile` for Railpack, mirrored in `railway.toml` for Nixpacks. Env vars are the same as `.env.example` plus `STREAMLIT_URL` (the callback destination after magic-link exchange).
+- **Frontend (Streamlit)** → Streamlit Community Cloud. Reads secrets from a TOML block: `BACKEND_URL`, `APP_URL` (backend `/auth/callback`), `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `APP_ENV=production`.
+- **Auth flow** — Supabase magic link → backend `/auth/callback` (extracts session token from URL fragment via a static HTML page) → Streamlit with `?rt=…` → refresh-token flow keeps the session across page reloads.
 
-# create project + service
-railway init
-# in Railway dashboard: Variables → paste every var from .env
-railway up
-```
-
-`railway.toml` already sets the start command: `uvicorn backend.main:app --host 0.0.0.0 --port ${PORT}`.
+Redirect URLs must be allowlisted in Supabase → Authentication → URL Configuration, including the exact backend callback path (Supabase does path-specific matching, silently falls back to Site URL if unmatched).
 
 ---
 
