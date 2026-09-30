@@ -22,8 +22,11 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 # --- Config ------------------------------------------------------------------
 
-BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+# Trailing slash on BACKEND_URL makes every f"{BACKEND_URL}/path" call hit
+# `//path`, which FastAPI treats as a distinct route and 404s on. Strip it
+# here so a misconfigured env doesn't silently break every backend call.
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000").rstrip("/")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
 # Dev-only: free-tier Supabase can't customize email templates to include the OTP
 # code, so we allow the service-role key to bypass email verification for local
@@ -460,8 +463,18 @@ def main() -> None:
         _render_auth_screen()
         return
 
+    # Detect admin role BEFORE building the sidebar so the debug caption can
+    # show the last role-check outcome.
+    is_admin = _fetch_role_is_admin()
+
     with st.sidebar:
         st.write(f"Signed in as **{st.session_state.get('user_email')}**")
+        # Small debug caption showing why is_admin resolved the way it did.
+        # Handy when the admin tab doesn't appear for an account you know
+        # should be admin. Safe to leave in — no secret content.
+        st.caption(
+            f"role check: {st.session_state.get('_role_debug', '(not yet)')}"
+        )
         _render_sidebar_weight_log()
         if st.button("Sign out"):
             # Best-effort server-side revoke so the refresh_token that just
@@ -477,10 +490,6 @@ def main() -> None:
             st.query_params.clear()
             st.rerun()
 
-    # Detect admin role — sourced from public.users.role via /me/profile-like
-    # endpoint. We reuse /hitl/pending to piggyback role info… simpler: just
-    # fetch users row via a fresh anon-scoped Supabase call using stored JWT.
-    is_admin = _fetch_role_is_admin()
     tabs_labels = ["Today's plan", "History", "Preferences", "Onboarding"]
     if is_admin:
         tabs_labels.append("Admin")
@@ -1401,16 +1410,33 @@ def _render_history() -> None:
 
 
 def _fetch_role_is_admin() -> bool:
+    """Fetch role from the backend. Bypass the shared 30-s cache — role is
+    tiny and confusing when stale (e.g. after sign-out/sign-in as a different
+    user). Also stash the raw response in session_state so the sidebar can
+    surface WHY the admin tab isn't showing when it should."""
     token = st.session_state.get("access_token")
     if not token:
+        st.session_state["_role_debug"] = "no token"
         return False
     try:
-        resp = _cached_get("/onboarding/me/role", token)
-    except httpx.HTTPError:
+        resp = httpx.get(
+            f"{BACKEND_URL}/onboarding/me/role",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+    except httpx.HTTPError as exc:
+        st.session_state["_role_debug"] = f"transport error: {exc}"
         return False
     if resp.status_code >= 400:
+        st.session_state["_role_debug"] = f"HTTP {resp.status_code}: {resp.text[:200]}"
         return False
-    return resp.json().get("role") == "admin"
+    try:
+        role = resp.json().get("role")
+    except Exception as exc:
+        st.session_state["_role_debug"] = f"JSON parse failed: {exc}: {resp.text[:200]}"
+        return False
+    st.session_state["_role_debug"] = f"role={role!r}"
+    return role == "admin"
 
 
 # --- Admin console (merged from admin_app.py) ------------------------------
