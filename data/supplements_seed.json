@@ -1,0 +1,10 @@
+{
+  "whey": {"display_name": "Whey Protein (1 scoop)", "servings_per_day": 1, "kcal_per_serving": 120, "protein_g_per_serving": 25, "carbs_g_per_serving": 3, "fats_g_per_serving": 1.5},
+  "casein": {"display_name": "Casein Protein (1 scoop)", "servings_per_day": 1, "kcal_per_serving": 110, "protein_g_per_serving": 24, "carbs_g_per_serving": 3, "fats_g_per_serving": 0.5},
+  "mass_gainer": {"display_name": "Mass Gainer (1 scoop)", "servings_per_day": 1, "kcal_per_serving": 550, "protein_g_per_serving": 30, "carbs_g_per_serving": 90, "fats_g_per_serving": 5},
+  "creatine": {"display_name": "Creatine (5g)", "servings_per_day": 1, "kcal_per_serving": 0, "protein_g_per_serving": 0, "carbs_g_per_serving": 0, "fats_g_per_serving": 0},
+  "bcaa": {"display_name": "BCAA (1 scoop)", "servings_per_day": 1, "kcal_per_serving": 20, "protein_g_per_serving": 5, "carbs_g_per_serving": 0, "fats_g_per_serving": 0},
+  "multivitamin": {"display_name": "Multivitamin", "servings_per_day": 1, "kcal_per_serving": 0, "protein_g_per_serving": 0, "carbs_g_per_serving": 0, "fats_g_per_serving": 0},
+  "fish_oil": {"display_name": "Fish Oil (1 capsule)", "servings_per_day": 2, "kcal_per_serving": 10, "protein_g_per_serving": 0, "carbs_g_per_serving": 0, "fats_g_per_serving": 1},
+  "peanut_butter": {"display_name": "Peanut Butter (2 tbsp)", "servings_per_day": 1, "kcal_per_serving": 190, "protein_g_per_serving": 8, "carbs_g_per_serving": 6, "fats_g_per_serving": 16}
+}
