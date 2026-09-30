@@ -257,6 +257,14 @@ def _handle_magic_link_callback() -> None:
     if rt:
         try:
             client = _get_client()
+            # Some supabase-py versions require the client to have a session
+            # loaded before `refresh_session()` will accept a positional rt.
+            # Priming the client with a blank access token + the rt handles
+            # both API variants without a version check.
+            try:
+                client.auth.set_session("", rt)
+            except Exception:
+                pass
             refreshed = client.auth.refresh_session(rt)
             session = getattr(refreshed, "session", None) or refreshed
             new_at = getattr(session, "access_token", None)
@@ -264,17 +272,24 @@ def _handle_magic_link_callback() -> None:
             user_obj = getattr(session, "user", None)
             email = getattr(user_obj, "email", None) if user_obj else None
             if not new_at or not email:
-                raise RuntimeError("refresh_session returned no session")
+                raise RuntimeError(
+                    f"refresh_session returned no session (at={bool(new_at)}, email={bool(email)})"
+                )
             st.session_state.access_token = new_at
             st.session_state.user_email = email
             # Supabase rotates the refresh_token; persist the new one so the
             # next reload works too.
             st.query_params["rt"] = new_rt or rt
             st.rerun()
-        except Exception:
-            # Refresh failed (rt expired, revoked, or Supabase down). Wipe
-            # the stale URL param so the user gets a clean sign-in screen
-            # rather than a redirect loop.
+        except Exception as exc:
+            # Refresh failed (rt expired, revoked, Supabase down, or SDK
+            # mismatch). Surface it once so the user can tell us WHY instead
+            # of silently bouncing to the sign-in screen. Then clear the URL
+            # so retries don't loop on the same broken token.
+            st.warning(
+                f"Session refresh failed — please sign in again. "
+                f"(details: {type(exc).__name__}: {exc})"
+            )
             st.query_params.clear()
 
 
