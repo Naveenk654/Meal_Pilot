@@ -232,10 +232,12 @@ async def generate_candidates_node(state: dict[str, Any]) -> dict[str, Any]:
     # Deterministic post-processing: shrink over-target plans before validation.
     # The LLM is unreliable at holding a kcal ceiling across many items; the
     # scaler enforces it in Python (matches §4 "deterministic for all numeric
-    # calc"). Only fires when a plan is >110% of target — under-target plans
-    # go straight through to the revision loop.
-    target: Macros = state["target_macros"]
-    plans, scaled_count = scale_candidates_to_kcal(plans, target)
+    # calc"). Only fires when a plan is >110% of the ACTIVE planning window —
+    # mid-day replans must be sized against what's left, not the full-day
+    # target, or the bumper inflates a legitimate dinner-only plan into the
+    # kcal ceiling and the validator rejects it.
+    planning_target: Macros = state["planning_remaining_macros"]
+    plans, scaled_count = scale_candidates_to_kcal(plans, planning_target)
     if scaled_count > 0:
         trace.append(
             TraceEvent(
@@ -262,7 +264,7 @@ async def generate_candidates_node(state: dict[str, Any]) -> dict[str, Any]:
                 r["dish_name_normalized"]: float(r["practical_max_servings_per_day"])
                 for r in rows
             }
-    plans, bumped_count = bump_candidates_to_protein_floor(plans, target, practical_caps)
+    plans, bumped_count = bump_candidates_to_protein_floor(plans, planning_target, practical_caps)
     if bumped_count > 0:
         trace.append(
             TraceEvent(
@@ -518,11 +520,16 @@ def invoke_fallback_node(state: dict[str, Any], svc: Client) -> dict[str, Any]:
     """
     trace: list[TraceEvent] = list(state.get("reasoning_trace") or [])
     profile: UserProfile = state["profile"]
-    target: Macros = state["target_macros"]
+    # Mid-day replan correctness: all sizing (distance ranking, gap
+    # computation, kcal ceiling) must be against what's LEFT to plan for,
+    # not the full-day target. Otherwise after a meal is logged the fallback
+    # tries to close a protein gap against the full day's budget and either
+    # over-shops at canteen or trips the validator's remaining-based ceiling.
+    target: Macros = state["planning_remaining_macros"]
 
     # Base for augmentation. Prefer the best VALID mess candidate; failing
-    # that, use the mess candidate closest to target macros as base. Only fall
-    # back to an empty plan if there are literally no mess candidates.
+    # that, use the mess candidate closest to the remaining macros as base.
+    # Only fall back to an empty plan if there are literally no mess candidates.
     candidates: list[CandidatePlan] = state.get("candidate_plans") or []
     results: list[ValidationResult] = state.get("validation_results") or []
     from backend.models.plan import CandidatePlan as _CP

@@ -243,3 +243,74 @@ def test_graph_no_active_menu_exits_immediately():
     nodes = asyncio.run(_collect_nodes(_state(with_menu=False), gen))
     print(f"\n[d] SEQUENCE: {' -> '.join(nodes)}")
     assert nodes == ["check_menu_freshness"], nodes
+
+
+def test_graph_mid_day_replan_sizes_against_planning_remaining():
+    """Regression for the bug where the serving scaler, protein bumper, and
+    canteen-fallback gap used the full-day target_macros to size candidates
+    even when consumed_macros was non-trivial.
+
+    Repro: user logged breakfast + lunch (1400 kcal / 80g protein consumed).
+    planning_remaining = 900 kcal / 40g protein. Mock LLM returns a
+    dinner-only plan at 790 kcal / 38g protein — a reasonable dinner that
+    fits what's left.
+
+    Pre-fix: bumper saw target_macros.protein_g=120, floor=0.9*120=108,
+    inflated the dinner entry until it hit the kcal headroom, then the
+    validator (now on planning_remaining) rejected it for exceeding
+    1.20 * 900 kcal = 1080 kcal. No plan committed.
+
+    Post-fix: scaler/bumper/fallback all size against planning_remaining,
+    so the 790/38 plan passes untouched and commits.
+    """
+    dow = date.today().weekday()
+    # Build a menu that includes a DINNER item (default _menu has only
+    # breakfast + lunch, which would trip MEAL_SLOT_MISMATCH on a dinner entry).
+    menu = ResolvedDailyMenu(
+        cycle_id=1, effective_from=date.today(), effective_to=date.today(),
+        version=1, content_hash="h", source="manual",
+        items=[
+            ResolvedMenuItem(
+                day_of_week=dow, meal=MealSlot.DINNER,
+                dish_name="Paneer Bhurji", dish_normalized="paneer_bhurji",
+                is_veg=True, macro_id=10, confidence=1.0,
+            ),
+        ],
+    )
+
+    state_dict = _state()
+    state_dict["todays_menu"] = menu
+    state_dict["consumed_macros"] = Macros(kcal=1400, protein_g=80, carbs_g=180, fats_g=40)
+    state_dict["macro_delta"] = MacrosSigned(kcal=900, protein_g=40, carbs_g=70, fats_g=30)
+    state_dict["planning_remaining_macros"] = Macros(kcal=900, protein_g=40, carbs_g=70, fats_g=30)
+    state_dict["meals_completed"] = [MealSlot.BREAKFAST, MealSlot.LUNCH]
+    state_dict["meals_remaining"] = [MealSlot.SNACK, MealSlot.DINNER]
+
+    dinner_macros = Macros(kcal=790, protein_g=38, carbs_g=55, fats_g=42)
+    dinner_entry = PlanMealEntry(
+        meal=MealSlot.DINNER, source="mess", dish_ref="paneer_bhurji",
+        servings=1.0, macros=dinner_macros, price_inr=0.0, macro_verified=True,
+    )
+    dinner_only = CandidatePlan(
+        candidate_id="dinner-only", entries=[dinner_entry],
+        total_macros=dinner_macros, total_cost_inr=0.0, generated_by="llm_plan",
+    )
+
+    async def gen(inputs, **kwargs):
+        return ([dinner_only], _FAKE_LLM)
+
+    nodes = asyncio.run(_collect_nodes(state_dict, gen))
+    print(f"\n[e] SEQUENCE: {' -> '.join(nodes)}")
+
+    # Plan must survive scaler + bumper + validator and reach commit.
+    assert "commit" in nodes, (
+        "mid-day plan rejected before commit — scaler/bumper likely still "
+        f"sizing against full-day target. Visited: {nodes}"
+    )
+    # And must NOT loop into revision / fallback — those indicate the
+    # validator rejected the plan (which is what the bug produced).
+    assert nodes.count("generate") == 1, (
+        f"revision loop fired — scaler probably inflated the plan then "
+        f"validator rejected. Visited: {nodes}"
+    )
+    assert "fallback_pre_select" not in nodes, nodes
