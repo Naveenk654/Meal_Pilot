@@ -560,11 +560,6 @@ def _render_today_plan() -> None:
         )
         return
 
-    # Surface any pending HITL requests at the top of the tab so the user
-    # sees low-confidence / fallback-approval / weekly-review prompts without
-    # having to scroll past the plan.
-    _render_hitl_pending(token)
-
     col_l, col_m, col_r = st.columns([1, 1, 2])
     force = col_r.checkbox("Force fresh run (ignore prior)", value=False)
     if col_m.button("Override plan", help="Reject the current plan and force a fresh one"):
@@ -660,6 +655,7 @@ def _render_today_plan() -> None:
                 "one from the Admin tab if you have that role."
             )
         _render_topup_card(token)
+        _render_hitl_pending(token)
         return
 
     if plan.get("menu_stale"):
@@ -780,6 +776,7 @@ def _render_today_plan() -> None:
             _render_log_buttons(meal, entries, token)
 
     _render_topup_card(token)
+    _render_hitl_pending(token)
 
 
 # --- End-of-day top-up card (M5) -------------------------------------------
@@ -958,7 +955,11 @@ def _render_macro_tracker(token: str) -> None:
 
 
 def _render_hitl_pending(token: str) -> None:
-    """M5/M6: surface pending HITL requests inline on the Today's plan tab."""
+    """Collapsed expander at the bottom of Today's plan — ONLY weekly_review
+    surfaces. Planner-generated prompts (constraint_infeasible, fallback_
+    proposal, low_confidence, plan_approval, menu_uncertain) are suppressed
+    from the UI because they aren't meaningfully actionable by the end user —
+    they still exist as rows in `hitl_requests` for audit."""
     try:
         resp = _cached_get("/hitl/pending", token)
     except httpx.HTTPError:
@@ -966,35 +967,24 @@ def _render_hitl_pending(token: str) -> None:
     if resp.status_code >= 400:
         return
     reqs = resp.json() or []
-    if not reqs:
+    reviews = [r for r in reqs if r.get("surface") == "weekly_review"]
+    if not reviews:
         return
-    st.markdown("### 🙋 Pending review")
-    for req in reqs:
-        with st.container(border=True):
-            st.markdown(f"**{req['surface']}** · {req['question']}")
-            # Weekly review — per-fact approve/reject.
-            if req["surface"] == "weekly_review" and req.get("options"):
-                for opt in req["options"]:
-                    mid = opt.get("memory_id")
-                    c1, c2, c3 = st.columns([4, 1, 1])
-                    c1.write(f"• {opt.get('fact')}  _(conf {opt.get('confidence',0):.2f})_")
-                    if c2.button("✓", key=f"mem-a-{mid}"):
-                        _decide_memory(mid, "approve", token)
-                    if c3.button("✗", key=f"mem-r-{mid}"):
-                        _decide_memory(mid, "reject", token)
-                # Also let the user dismiss the whole review card.
-                if st.button("Done reviewing", key=f"hitl-done-{req['id']}"):
-                    _hitl_respond(req["id"], "approved", token)
-                continue
-            if req.get("options"):
-                st.json(req["options"])
-            if req.get("context"):
-                st.caption(str(req["context"]))
-            col_a, col_r = st.columns(2)
-            if col_a.button("Approve", key=f"hitl-a-{req['id']}", type="primary"):
+    label = f"💬 {len(reviews)} learning review" + ("s" if len(reviews) != 1 else "")
+    with st.expander(label, expanded=False):
+        for req in reviews:
+            st.caption(req.get("question", "Weekly review"))
+            for opt in req.get("options") or []:
+                mid = opt.get("memory_id")
+                c1, c2, c3 = st.columns([5, 1, 1])
+                c1.write(f"• {opt.get('fact')}  _(confidence {opt.get('confidence', 0):.2f})_")
+                if c2.button("✓", key=f"mem-a-{mid}"):
+                    _decide_memory(mid, "approve", token)
+                if c3.button("✗", key=f"mem-r-{mid}"):
+                    _decide_memory(mid, "reject", token)
+            if st.button("Done reviewing", key=f"hitl-done-{req['id']}"):
                 _hitl_respond(req["id"], "approved", token)
-            if col_r.button("Reject", key=f"hitl-r-{req['id']}"):
-                _hitl_respond(req["id"], "rejected", token)
+            st.divider()
 
 
 def _decide_memory(memory_id: int, decision: str, token: str) -> None:
