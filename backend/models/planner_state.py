@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import TypedDict
+from typing import Any, TypedDict
 
+from supabase import Client
+
+from backend.config import Settings
 from backend.models.canteen import CanteenOption
 from backend.models.enums import HITLStatus, MealSlot, Trigger
 from backend.models.menu import DailyMenu, MenuFreshness
 from backend.models.nutrition import Macros, MacrosSigned
 from backend.models.plan import CandidatePlan, ConfidenceBreakdown, Plan, ValidationResult
 from backend.models.trace import TraceEvent
-from backend.models.user import BehavioralFact, UserProfile
+from backend.models.user import BehavioralFact, UserPreference, UserProfile
 
 
 class PlannerState(TypedDict, total=False):
-    """The LangGraph state contract (§5). TypedDict because LangGraph merges nodes' partial returns."""
+    """The LangGraph state contract (§5). TypedDict because LangGraph merges
+    nodes' partial returns. Underscore-prefixed keys are runtime scratch —
+    declared here so LangGraph's channel inference preserves them across
+    nodes, NOT part of the §5 public contract."""
 
     # Identity
     user_id: str
@@ -56,3 +62,14 @@ class PlannerState(TypedDict, total=False):
     # Output
     final_plan: Plan | None
     reasoning_trace: list[TraceEvent]
+
+    # Runtime scratch (not part of §5)
+    _svc_client: Client
+    _settings: Settings
+    _preferences: list[UserPreference]
+    _pushed_trace_count: int
+    _route: str
+    _last_llm: dict[str, Any]
+    _tool_errors: int
+    _tool_calls: int
+    _recent_dishes: list[str]

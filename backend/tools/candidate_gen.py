@@ -293,7 +293,8 @@ async def generate_candidates(
                 generated_by="llm_plan",
             )
         )
-    return plans, result
+    # Enforce MAX_CANDIDATES on the actual list; prompt-level `n` is advisory.
+    return plans[: inputs.n_candidates], result
 
 
 async def generate_revised_candidates(

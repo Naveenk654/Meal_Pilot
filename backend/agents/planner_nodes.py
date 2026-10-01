@@ -40,7 +40,7 @@ from backend.models.plan import (
     ValidationResult,
 )
 from backend.models.trace import TraceEvent
-from backend.models.user import UserPreference, UserProfile
+from backend.models.user import BehavioralFact, UserPreference, UserProfile
 from backend.tools.candidate_gen import (
     CandidateGenError,
     CandidateGenInputs,
@@ -450,7 +450,9 @@ def score_and_select_node(state: dict[str, Any]) -> dict[str, Any]:
 def check_confidence_node(state: dict[str, Any]) -> dict[str, Any]:
     plan: Plan | None = state.get("selected_plan")
     if plan is None:
-        return {}
+        # No plan to score; return a no-op write so LangGraph accepts the step
+        # (empty-dict returns raise InvalidUpdateError).
+        return {"reasoning_trace": list(state.get("reasoning_trace") or [])}
     s: Settings = state["_settings"]
     results: list[ValidationResult] = state.get("validation_results") or []
     valid_scores = [r.total_soft_score for r in results if r.is_valid]
@@ -648,7 +650,8 @@ def commit_plan_node(state: dict[str, Any], svc: Client) -> dict[str, Any]:
     """
     plan: Plan | None = state.get("selected_plan")
     if plan is None:
-        return {}
+        # Nothing to commit; no-op write so LangGraph accepts the step.
+        return {"reasoning_trace": list(state.get("reasoning_trace") or [])}
     todays_menu = state.get("todays_menu")
     cycle_id_used = getattr(todays_menu, "cycle_id", None) if todays_menu else None
     try:

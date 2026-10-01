@@ -212,6 +212,27 @@ def test_macro_protein_floor_invalidates_underscore():
     assert any(v.type is HardViolationType.MACRO_PROTEIN_FLOOR for v in result.hard_violations)
 
 
+def test_mid_day_replan_uses_planning_remaining_for_protein_floor():
+    """Dinner-only candidate: full-day target 120g protein, 80g already eaten
+    so planning_remaining=40g. Plan has 35g protein, min_protein_ratio=0.60.
+    The floor must be 0.60 * 40 = 24g (not 72g), so the plan is VALID."""
+    cand = _candidate(
+        _entry(MealSlot.DINNER, "chicken_curry", kcal=600, protein=35, source="mess"),
+    )
+    inputs = _inputs(
+        target_macros=Macros(kcal=2300, protein_g=120, carbs_g=250, fats_g=70),
+        planning_remaining=Macros(kcal=750, protein_g=40, carbs_g=80, fats_g=25),
+        min_protein_ratio=0.60,
+        max_kcal_ratio=1.20,
+        veg_today=False,
+        todays_menu=_menu(("chicken_curry", MealSlot.DINNER, False)),
+    )
+    result = validate_candidate(cand, inputs)
+    assert result.is_valid, (
+        f"mid-day replan wrongly rejected: {[v.model_dump() for v in result.hard_violations]}"
+    )
+
+
 def test_preferences_move_soft_score():
     baseline = validate_candidate(
         _candidate(_entry(MealSlot.BREAKFAST, "aloo_paratha")),

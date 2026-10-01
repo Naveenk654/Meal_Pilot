@@ -214,28 +214,31 @@ def validate_candidate(
             )
         )
 
-    # Macro sanity — bends §8's soft-macro rule so absurd plans get rejected.
-    target_kcal = inputs.target_macros.kcal
-    target_protein = inputs.target_macros.protein_g
+    # Macro sanity against the ACTIVE planning window (remaining = target
+    # minus already-consumed) so mid-day replans aren't rejected for being
+    # smaller than the full-day target. At start-of-day planning_remaining
+    # equals target_macros so behavior is unchanged for the morning run.
+    budget_kcal = inputs.planning_remaining.kcal
+    budget_protein = inputs.planning_remaining.protein_g
     plan_kcal = candidate.total_macros.kcal
     plan_protein = candidate.total_macros.protein_g
-    if target_kcal > 0 and plan_kcal > inputs.max_kcal_ratio * target_kcal:
+    if budget_kcal > 0 and plan_kcal > inputs.max_kcal_ratio * budget_kcal:
         violations.append(
             HardViolation(
                 type=HardViolationType.MACRO_KCAL_CEILING,
                 detail=(
                     f"plan kcal {plan_kcal:.0f} exceeds {inputs.max_kcal_ratio:.0%} "
-                    f"of target {target_kcal:.0f}"
+                    f"of remaining {budget_kcal:.0f}"
                 ),
             )
         )
-    if target_protein > 0 and plan_protein < inputs.min_protein_ratio * target_protein:
+    if budget_protein > 0 and plan_protein < inputs.min_protein_ratio * budget_protein:
         violations.append(
             HardViolation(
                 type=HardViolationType.MACRO_PROTEIN_FLOOR,
                 detail=(
                     f"plan protein {plan_protein:.0f}g below {inputs.min_protein_ratio:.0%} "
-                    f"of target {target_protein:.0f}g"
+                    f"of remaining {budget_protein:.0f}g"
                 ),
             )
         )
@@ -283,7 +286,10 @@ def validate_candidate(
             )
 
     is_valid = not violations
-    deviation = _signed_deviation(candidate.total_macros, inputs.target_macros)
+    # Score deviation against the active planning window too — mid-day plans
+    # should be judged on how well they close the remaining gap, not against
+    # the full day's target.
+    deviation = _signed_deviation(candidate.total_macros, inputs.planning_remaining)
     budget_deviation = total_cost - inputs.soft_budget_inr
 
     preference_score = _preference_score(candidate.entries, like_terms, dislike_terms)
@@ -295,7 +301,7 @@ def validate_candidate(
     total_soft = _weighted_soft_score(
         weights=inputs.weights,
         deviation=deviation,
-        target=inputs.target_macros,
+        target=inputs.planning_remaining,
         budget_deviation=budget_deviation,
         soft_budget=inputs.soft_budget_inr,
         preference_score=preference_score,

@@ -21,14 +21,68 @@ Given a hostel mess menu (uploaded as PDF), a student's onboarding profile (age 
 - ✅ **M3 — Planner Agent:** LangGraph state machine, deterministic constraint engine, confidence calculator, plan lifecycle (`draft → sent → superseded`).
 - ✅ **M4 — Meal Logging:** append-only logs, idempotent writes, macro tracker, mid-day replan.
 - ✅ **M5 (partial) — Canteen top-up + HITL surfaces:** deterministic gap-fill, HITL memory review, mixed-mode planning.
-- 140/140 tests passing on the current main.
+- 144 passing on `main`. (One pre-existing teardown-FK failure in `test_meal_log_endpoint` is tracked separately — unrelated to the planner or agents.)
 
 ## Architecture — one line each
 
-- **Three agents:** Planner (LangGraph), Menu Intelligence (PDF → macros), Profile & Learning (weekly).
+- **Three agents:** Planner (LangGraph `StateGraph` — 14 nodes, conditional routing, bounded revision loop) + Menu Intelligence and Learning (linear LLM pipelines). All three share one `agent_runs` / `decision_traces` audit lineage.
 - **Everything else is a tool, not an agent:** nutrition math, constraint engine, canteen picker, confidence, memory.
 - **Deterministic Python for every number.** LLMs propose; Python validates and computes. Constraint engine has final say before commit.
 - **Append-only meal_logs, idempotent writes** (client `event_id` = unique constraint), version-guarded plan writes to survive concurrent replans.
+
+## Planner graph
+
+The Planner is a real `langgraph.graph.StateGraph` compiled per request, invoked via `app.ainvoke(state, {"recursion_limit": …})`. The main spine is **generate → validate → classify → score → check_confidence → commit**. Three failure escapes feed back into the spine: revision loop (bounded by `max_revisions`), pre-select canteen fallback (when mess-only is infeasible), and post-select canteen augmentation (when the winning mess-only plan is too weak). Rendered from `graph.get_graph().draw_mermaid()`:
+
+```mermaid
+%%{init: {'flowchart': {'curve': 'linear'}}}%%
+graph TD;
+    __start__([__start__]):::first
+    check_menu_freshness(check_menu_freshness)
+    generate(generate)
+    validate(validate)
+    classify(classify)
+    fallback_pre_select(fallback_pre_select)
+    revalidate_pre(revalidate_pre)
+    clear_infeasible(clear_infeasible)
+    score(score)
+    check_confidence(check_confidence)
+    fallback_augment(fallback_augment)
+    revalidate_augment(revalidate_augment)
+    score_augment(score_augment)
+    check_confidence_augment(check_confidence_augment)
+    commit(commit)
+    __end__([__end__]):::last
+    __start__ --> check_menu_freshness;
+    check_confidence_augment --> commit;
+    commit --> __end__;
+    revalidate_pre --> clear_infeasible;
+    score --> check_confidence;
+    score_augment --> check_confidence_augment;
+    validate --> classify;
+    check_menu_freshness -.-> generate;
+    check_menu_freshness -. end .-> __end__;
+    generate -.-> validate;
+    generate -.-> fallback_pre_select;
+    classify -.-> score;
+    classify -.-> generate;
+    classify -.-> fallback_pre_select;
+    fallback_pre_select -.-> revalidate_pre;
+    fallback_pre_select -. end .-> __end__;
+    clear_infeasible -.-> score;
+    clear_infeasible -. end .-> __end__;
+    check_confidence -.-> fallback_augment;
+    check_confidence -.-> commit;
+    fallback_augment -.-> revalidate_augment;
+    fallback_augment -.-> commit;
+    revalidate_augment -.-> score_augment;
+    revalidate_augment -.-> commit;
+    classDef default fill:#f2f0ff,line-height:1.2
+    classDef first fill-opacity:0
+    classDef last fill:#bfb6fc
+```
+
+Node → function wiring lives in `backend/agents/planner_graph.py::_build_planner_graph`; nodes themselves are in `backend/agents/planner_nodes.py`. Side effects (HITL emission, `agent_run` wrap, decision-trace flush) stay in the `run_planner` wrapper so a crash inside the graph can't corrupt the audit trail. Full node-visit sequences for the valid / revise-exhausted / LLM-degraded / no-menu paths are asserted in `tests/test_planner_langgraph.py` (no DB, no LLM).
 
 ## Stack
 
@@ -117,6 +171,14 @@ backend/db/migrations/0006_plans_logs.sql
 backend/db/migrations/0007_hitl.sql
 backend/db/migrations/0008_observability.sql
 backend/db/migrations/0009_rls_policies.sql
+backend/db/migrations/0010_grants.sql
+backend/db/migrations/0011_hitl_enum_fix.sql
+backend/db/migrations/0012_menu_intel.sql
+backend/db/migrations/0013_weight_logs.sql
+backend/db/migrations/0014_plan_cycle_id_used.sql
+backend/db/migrations/0015_plan_mode.sql
+backend/db/migrations/0016_menu_choice_groups.sql
+backend/db/migrations/0017_lock_user_role.sql
 ```
 
 Each is idempotent (safe to re-run). Or use psql:

@@ -560,6 +560,11 @@ def _render_today_plan() -> None:
         )
         return
 
+    # Surface any pending HITL requests at the top of the tab so the user
+    # sees low-confidence / fallback-approval / weekly-review prompts without
+    # having to scroll past the plan.
+    _render_hitl_pending(token)
+
     col_l, col_m, col_r = st.columns([1, 1, 2])
     force = col_r.checkbox("Force fresh run (ignore prior)", value=False)
     if col_m.button("Override plan", help="Reject the current plan and force a fresh one"):

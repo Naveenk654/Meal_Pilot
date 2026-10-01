@@ -1,15 +1,37 @@
-"""LangGraph wiring for the Planner (§6.2).
+"""Planner agent — LangGraph `StateGraph` implementation (§6.2).
 
-We keep the graph definition small: nodes come from `planner_nodes`, and the
-router `run_planner` opens the `agent_run` context, invokes the graph, and
-returns the final state. Idempotency of retries is handled at the
-`agent_runs.idempotency_key` layer — the graph itself is stateless.
+The graph wires node functions from `planner_nodes.py` into a declarative
+state machine. `run_planner` opens the `agent_run` context, invokes the
+graph, then drains the final state into HITL emissions + `decision_traces`
+rows. All DB writes and HITL surfaces stay in the wrapper — the graph is
+pure state transitions.
 
-M3 scope reminder:
-  * Mess-only, no canteen fallback, no HITL loops. `invoke_fallback` and
-    `request_hitl` nodes are stubs that just set flags; the graph edges
-    route straight to terminal on infeasibility.
-  * MAX_CANDIDATES and MAX_REVISIONS are read from Settings.
+Graph shape:
+
+    START → menu_freshness ─┬─(infeasible)→ END
+                            └─(fresh)→ generate
+    generate ─┬─(infeasible)→ fallback_pre_select
+              └─(ok)→ validate → classify
+    classify ─┬─(select)→ score → confidence → maybe_augment
+              ├─(revise)→ generate
+              └─(infeasible)→ fallback_pre_select
+
+    fallback_pre_select ─┬─(no_candidates)→ END
+                         └─(added)→ revalidate_pre
+    revalidate_pre ─┬─(any_valid)→ score  (continues down the main spine)
+                    └─(none)→ END
+
+    maybe_augment ─┬─(should_augment)→ fallback_augment
+                   └─(no)→ commit
+    fallback_augment ─┬─(no_candidates)→ commit
+                      └─(added)→ revalidate_augment
+    revalidate_augment ─┬─(any_valid)→ score_augment → confidence_augment → commit
+                        └─(none)→ commit
+    commit → END
+
+Node *functions* are shared between the pre-select and augment branches —
+LangGraph just registers the same callable under two different node names
+so the compiled graph has non-cyclic conditional edges.
 """
 from __future__ import annotations
 
@@ -17,6 +39,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+from langgraph.graph import END, START, StateGraph
 from supabase import Client
 
 from backend.agents.planner_nodes import (
@@ -34,6 +57,7 @@ from backend.config import Settings, get_settings
 from backend.idempotency.keys import planner_run_key
 from backend.models.enums import HITLStatus, PlanMode, Trigger
 from backend.models.plan import Plan
+from backend.models.planner_state import PlannerState
 from backend.models.trace import TraceEvent
 from backend.tools.hitl import HITLSurface, create_hitl_request
 from backend.tools.trace import agent_run
@@ -50,6 +74,162 @@ class PlannerOutcome:
     trace: list[TraceEvent]
 
 
+# --- Graph build -----------------------------------------------------------
+
+
+def _build_planner_graph(svc: Client):
+    """Compile the Planner `StateGraph`.
+
+    `svc` is captured in closures for the two nodes that need DB access
+    (`invoke_fallback_node`, `commit_plan_node`) — this keeps the node
+    signatures in `planner_nodes.py` untouched while still letting the
+    graph treat every node as a `state -> partial_state` function.
+    """
+
+    def _menu_freshness(state: dict[str, Any]) -> dict[str, Any]:
+        return check_menu_freshness(state)
+
+    async def _generate(state: dict[str, Any]) -> dict[str, Any]:
+        return await generate_candidates_node(state)
+
+    def _validate(state: dict[str, Any]) -> dict[str, Any]:
+        return validate_candidates_node(state)
+
+    def _classify(state: dict[str, Any]) -> dict[str, Any]:
+        return classify_outcome(state)
+
+    def _fallback(state: dict[str, Any]) -> dict[str, Any]:
+        return invoke_fallback_node(state, svc)
+
+    def _score(state: dict[str, Any]) -> dict[str, Any]:
+        return score_and_select_node(state)
+
+    def _confidence(state: dict[str, Any]) -> dict[str, Any]:
+        return check_confidence_node(state)
+
+    def _commit(state: dict[str, Any]) -> dict[str, Any]:
+        return commit_plan_node(state, svc)
+
+    def _clear_infeasible_if_any_valid(state: dict[str, Any]) -> dict[str, Any]:
+        """After fallback+revalidate: clear infeasible if any candidate is now
+        valid; otherwise explicitly reaffirm infeasible so the following edge
+        routes to END. LangGraph rejects empty-dict returns, so we always
+        write at least one key."""
+        results = state.get("validation_results") or []
+        if any(r.is_valid for r in results):
+            return {"infeasible": False}
+        return {"infeasible": True}
+
+    # --- Routing functions ------------------------------------------------
+
+    def _route_after_freshness(state: dict[str, Any]) -> str:
+        return "end" if state.get("infeasible") else "generate"
+
+    def _route_after_generate(state: dict[str, Any]) -> str:
+        return "fallback_pre_select" if state.get("infeasible") else "validate"
+
+    def _route_after_classify(state: dict[str, Any]) -> str:
+        route = state.get("_route")
+        if route == "select":
+            return "score"
+        if route == "revise":
+            return "generate"
+        return "fallback_pre_select"
+
+    def _route_after_fallback_pre(state: dict[str, Any]) -> str:
+        return "revalidate_pre" if state.get("candidate_plans") else "end"
+
+    def _route_after_revalidate_pre(state: dict[str, Any]) -> str:
+        results = state.get("validation_results") or []
+        return "score" if any(r.is_valid for r in results) else "end"
+
+    def _route_after_confidence(state: dict[str, Any]) -> str:
+        settings: Settings = state["_settings"]
+        return "fallback_augment" if _should_augment_with_canteen(state, settings) else "commit"
+
+    def _route_after_fallback_augment(state: dict[str, Any]) -> str:
+        # When fallback found no additions, keep the pre-augment winner.
+        return "revalidate_augment" if state.get("candidate_plans") else "commit"
+
+    def _route_after_revalidate_augment(state: dict[str, Any]) -> str:
+        results = state.get("validation_results") or []
+        return "score_augment" if any(r.is_valid for r in results) else "commit"
+
+    # --- Assemble ---------------------------------------------------------
+
+    graph: StateGraph = StateGraph(PlannerState)
+
+    graph.add_node("check_menu_freshness", _menu_freshness)
+    graph.add_node("generate", _generate)
+    graph.add_node("validate", _validate)
+    graph.add_node("classify", _classify)
+    graph.add_node("fallback_pre_select", _fallback)
+    graph.add_node("revalidate_pre", _validate)
+    graph.add_node("clear_infeasible", _clear_infeasible_if_any_valid)
+    graph.add_node("score", _score)
+    graph.add_node("check_confidence", _confidence)
+    graph.add_node("fallback_augment", _fallback)
+    graph.add_node("revalidate_augment", _validate)
+    graph.add_node("score_augment", _score)
+    graph.add_node("check_confidence_augment", _confidence)
+    graph.add_node("commit", _commit)
+
+    graph.add_edge(START, "check_menu_freshness")
+    graph.add_conditional_edges(
+        "check_menu_freshness", _route_after_freshness, {"generate": "generate", "end": END}
+    )
+    graph.add_conditional_edges(
+        "generate",
+        _route_after_generate,
+        {"validate": "validate", "fallback_pre_select": "fallback_pre_select"},
+    )
+    graph.add_edge("validate", "classify")
+    graph.add_conditional_edges(
+        "classify",
+        _route_after_classify,
+        {
+            "score": "score",
+            "generate": "generate",
+            "fallback_pre_select": "fallback_pre_select",
+        },
+    )
+    graph.add_conditional_edges(
+        "fallback_pre_select",
+        _route_after_fallback_pre,
+        {"revalidate_pre": "revalidate_pre", "end": END},
+    )
+    graph.add_edge("revalidate_pre", "clear_infeasible")
+    graph.add_conditional_edges(
+        "clear_infeasible",
+        _route_after_revalidate_pre,
+        {"score": "score", "end": END},
+    )
+    graph.add_edge("score", "check_confidence")
+    graph.add_conditional_edges(
+        "check_confidence",
+        _route_after_confidence,
+        {"fallback_augment": "fallback_augment", "commit": "commit"},
+    )
+    graph.add_conditional_edges(
+        "fallback_augment",
+        _route_after_fallback_augment,
+        {"revalidate_augment": "revalidate_augment", "commit": "commit"},
+    )
+    graph.add_conditional_edges(
+        "revalidate_augment",
+        _route_after_revalidate_augment,
+        {"score_augment": "score_augment", "commit": "commit"},
+    )
+    graph.add_edge("score_augment", "check_confidence_augment")
+    graph.add_edge("check_confidence_augment", "commit")
+    graph.add_edge("commit", END)
+
+    return graph.compile()
+
+
+# --- Public entrypoint -----------------------------------------------------
+
+
 async def run_planner(
     svc: Client,
     *,
@@ -59,7 +239,7 @@ async def run_planner(
     triggering_event_id: str | None = None,
     settings: Settings | None = None,
 ) -> PlannerOutcome:
-    """One-shot invocation. Runs the graph and persists the audit trail."""
+    """One-shot invocation. Runs the LangGraph and persists the audit trail."""
     s = settings or get_settings()
     idem_key = planner_run_key(user_id, plan_date, trigger, triggering_event_id)
 
@@ -93,7 +273,6 @@ async def run_planner(
         triggering_event_id=triggering_event_id,
     ) as run:
         if not run.inserted:
-            # Idempotent short-circuit: the caller must accept the earlier outcome.
             return PlannerOutcome(
                 inserted=False,
                 final_plan=None,
@@ -114,142 +293,123 @@ async def run_planner(
         )
         state["_svc_client"] = svc
 
-        # Menu uncertainty is a hard exit + HITL surface #2.
-        state.update(check_menu_freshness(state))
-        if state.get("infeasible"):
-            _create_hitl(
-                svc,
-                user_id=user_id,
-                surface=HITLSurface.MENU_UNCERTAIN,
-                question="No active menu covers today. Confirm to proceed with canteen-only planning.",
-                context={"date": plan_date.isoformat()},
-            )
-            state["hitl_status"] = HITLStatus.PENDING
-            _flush_trace(run, state, final=True)
-            return _outcome(state, idem_key)
+        app = _build_planner_graph(svc)
+        # Recursion limit covers worst-case walk: freshness → (generate → validate
+        # → classify) × (max_revisions + 1) → fallback_pre_select → revalidate_pre
+        # → clear_infeasible → score → confidence → fallback_augment →
+        # revalidate_augment → score_augment → confidence_augment → commit. Add
+        # headroom for conditional-edge resolution steps.
+        recursion_limit = 10 + (s.max_revisions + 1) * 3 + 15
+        final_state = await app.ainvoke(state, {"recursion_limit": recursion_limit})
 
-        # Bounded generate → validate → revise loop (mess-only).
-        while True:
-            state.update(await generate_candidates_node(state))
-            if state.get("infeasible"):
-                break
-            state.update(validate_candidates_node(state))
-            classify = classify_outcome(state)
-            state.update(classify)
-            route = classify.get("_route")
-            if route == "select":
-                break
-            if route == "infeasible":
-                break
+        # Side effects: HITL emission + decision_trace flush + agent_runs outcome.
+        _emit_hitl(svc, user_id=user_id, plan_date=plan_date, state=final_state, settings=s)
 
-        # M5 fallback: mess-only infeasible → invoke canteen fallback, then
-        # re-validate the augmented plan. Also invoked when mess-only produced
-        # a valid winner but confidence is low (checked below after scoring).
-        if state.get("infeasible"):
-            state.update(invoke_fallback_node(state, svc))
-            if state.get("candidate_plans"):
-                state.update(validate_candidates_node(state))
-                results = state.get("validation_results") or []
-                if any(r.is_valid for r in results):
-                    state["infeasible"] = False
-
-        if not state.get("infeasible"):
-            state.update(score_and_select_node(state))
-            state.update(check_confidence_node(state))
-            # Augment with canteen items when the mess-only winner isn't good
-            # enough. Three triggers, in priority order:
-            #   1. plan_mode='mixed' — user explicitly opted into a mess+shops
-            #      plan; augment every time up to budget_soft_inr.
-            #   2. Winning candidate's soft score below fallback_quality_
-            #      threshold — technically valid but silly (e.g. "4 servings
-            #      of tea to hit protein"). Catches practicality/variety
-            #      failures the hard-constraint layer misses.
-            #   3. hitl_status=PENDING from check_confidence_node — the
-            #      pre-existing M5 low-confidence safety net.
-            # All three are gated on `not fallback_invoked` so we only try
-            # augmentation once per run.
-            if _should_augment_with_canteen(state, s):
-                state.update(invoke_fallback_node(state, svc))
-                if state.get("candidate_plans"):
-                    state.update(validate_candidates_node(state))
-                    results = state.get("validation_results") or []
-                    if any(r.is_valid for r in results):
-                        state.update(score_and_select_node(state))
-                        state.update(check_confidence_node(state))
-            state.update(commit_plan_node(state, svc))
-
-            # Surface HITL #4 (fallback proposal) once, or #1 (low confidence).
-            if state.get("fallback_invoked") and state.get("final_plan"):
-                canteen_entries = [
-                    e for e in state["final_plan"].entries if getattr(e, "source", "mess") == "canteen"
-                ]
-                if canteen_entries:
-                    _create_hitl(
-                        svc,
-                        user_id=user_id,
-                        surface=HITLSurface.FALLBACK_PROPOSAL,
-                        question="Mess menu can't hit your macro targets alone. Approve these canteen additions?",
-                        options=[
-                            {
-                                "dish_ref": e.dish_ref,
-                                "servings": e.servings,
-                                "kcal": e.macros.kcal,
-                                "protein_g": e.macros.protein_g,
-                                "price_inr": e.price_inr,
-                            }
-                            for e in canteen_entries
-                        ],
-                        context={"plan_id": state["final_plan"].id, "date": plan_date.isoformat()},
-                    )
-                    state["hitl_status"] = HITLStatus.PENDING
-            elif state.get("hitl_status") == HITLStatus.PENDING and state.get("final_plan"):
-                _create_hitl(
-                    svc,
-                    user_id=user_id,
-                    surface=HITLSurface.LOW_CONFIDENCE,
-                    question=f"Plan confidence is {state.get('confidence'):.2f} — below threshold. Approve?",
-                    context={"plan_id": state["final_plan"].id, "date": plan_date.isoformat()},
-                )
-            elif s.hitl_always_approve_plan and state.get("final_plan"):
-                # Surface #7 — routine plan approval. Only when explicitly on.
-                _create_hitl(
-                    svc,
-                    user_id=user_id,
-                    surface=HITLSurface.PLAN_APPROVAL,
-                    question="Does today's plan look good?",
-                    context={
-                        "plan_id": state["final_plan"].id,
-                        "date": plan_date.isoformat(),
-                        "confidence": state.get("confidence"),
-                    },
-                )
-        else:
-            # Infeasible even after fallback → surface #3.
-            _create_hitl(
-                svc,
-                user_id=user_id,
-                surface=HITLSurface.CONSTRAINT_INFEASIBLE,
-                question="No feasible plan today from mess or canteen. Relax a constraint?",
-                context={"date": plan_date.isoformat()},
-            )
-            state["hitl_status"] = HITLStatus.PENDING
-
-        _flush_trace(run, state, final=True)
-        final_plan: Plan | None = state.get("final_plan")
+        _flush_trace(run, final_state, final=True)
+        final_plan: Plan | None = final_state.get("final_plan")
         run.set_final_outcome(
-            confidence=state.get("confidence"),
+            confidence=final_state.get("confidence"),
             confidence_factors=(
-                state["confidence_factors"].model_dump()
-                if state.get("confidence_factors") is not None
+                final_state["confidence_factors"].model_dump()
+                if final_state.get("confidence_factors") is not None
                 else None
             ),
             final_outcome={
                 "plan_id": final_plan.id if final_plan else None,
-                "infeasible": bool(state.get("infeasible")),
+                "infeasible": bool(final_state.get("infeasible")),
             },
-            hitl_status=HITLStatus(state.get("hitl_status") or HITLStatus.NOT_NEEDED),
+            hitl_status=HITLStatus(final_state.get("hitl_status") or HITLStatus.NOT_NEEDED),
         )
-        return _outcome(state, idem_key)
+        return _outcome(final_state, idem_key)
+
+
+def _emit_hitl(
+    svc: Client,
+    *,
+    user_id: str,
+    plan_date: date,
+    state: dict[str, Any],
+    settings: Settings,
+) -> None:
+    """Fire the appropriate HITL surface based on terminal state.
+
+    Lives outside the graph so a Supabase hiccup here doesn't poison the
+    decision trace or the `agent_runs` row.
+    """
+    # Menu-uncertain exit (fired before anything else got a chance).
+    if state.get("infeasible") and state.get("todays_menu") is None:
+        _create_hitl(
+            svc,
+            user_id=user_id,
+            surface=HITLSurface.MENU_UNCERTAIN,
+            question="No active menu covers today. Confirm to proceed with canteen-only planning.",
+            context={"date": plan_date.isoformat()},
+        )
+        state["hitl_status"] = HITLStatus.PENDING
+        return
+
+    # Fallback produced a plan with canteen entries → ask the user to approve.
+    if state.get("fallback_invoked") and state.get("final_plan"):
+        canteen_entries = [
+            e for e in state["final_plan"].entries if getattr(e, "source", "mess") == "canteen"
+        ]
+        if canteen_entries:
+            _create_hitl(
+                svc,
+                user_id=user_id,
+                surface=HITLSurface.FALLBACK_PROPOSAL,
+                question="Mess menu can't hit your macro targets alone. Approve these canteen additions?",
+                options=[
+                    {
+                        "dish_ref": e.dish_ref,
+                        "servings": e.servings,
+                        "kcal": e.macros.kcal,
+                        "protein_g": e.macros.protein_g,
+                        "price_inr": e.price_inr,
+                    }
+                    for e in canteen_entries
+                ],
+                context={"plan_id": state["final_plan"].id, "date": plan_date.isoformat()},
+            )
+            state["hitl_status"] = HITLStatus.PENDING
+            return
+
+    # Low-confidence commit → confirmation surface.
+    if state.get("hitl_status") == HITLStatus.PENDING and state.get("final_plan"):
+        _create_hitl(
+            svc,
+            user_id=user_id,
+            surface=HITLSurface.LOW_CONFIDENCE,
+            question=f"Plan confidence is {state.get('confidence'):.2f} — below threshold. Approve?",
+            context={"plan_id": state["final_plan"].id, "date": plan_date.isoformat()},
+        )
+        return
+
+    # Routine plan approval (opt-in).
+    if settings.hitl_always_approve_plan and state.get("final_plan"):
+        _create_hitl(
+            svc,
+            user_id=user_id,
+            surface=HITLSurface.PLAN_APPROVAL,
+            question="Does today's plan look good?",
+            context={
+                "plan_id": state["final_plan"].id,
+                "date": plan_date.isoformat(),
+                "confidence": state.get("confidence"),
+            },
+        )
+        return
+
+    # Infeasible even after fallback → relax-a-constraint surface.
+    if state.get("infeasible"):
+        _create_hitl(
+            svc,
+            user_id=user_id,
+            surface=HITLSurface.CONSTRAINT_INFEASIBLE,
+            question="No feasible plan today from mess or canteen. Relax a constraint?",
+            context={"date": plan_date.isoformat()},
+        )
+        state["hitl_status"] = HITLStatus.PENDING
 
 
 def _should_augment_with_canteen(state: dict[str, Any], settings: Settings) -> bool:
@@ -274,7 +434,6 @@ def _should_augment_with_canteen(state: dict[str, Any], settings: Settings) -> b
         return False
 
     profile = state.get("profile")
-    # Mixed mode: candidates are already mess+canteen — no post-hoc fallback.
     if profile is not None and getattr(profile, "plan_mode", None) is PlanMode.MIXED:
         return False
 
