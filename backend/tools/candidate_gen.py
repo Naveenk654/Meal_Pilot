@@ -265,7 +265,12 @@ async def generate_candidates(
     # the JSON answer. Give them room; empty content forces our reasoning-field
     # fallback which won't have valid JSON.
     result = await call_llm(
-        prompt, system=_SYSTEM, temperature=temp, max_tokens=8192, settings=s
+        prompt,
+        system=_SYSTEM,
+        temperature=temp,
+        max_tokens=8192,
+        settings=s,
+        response_format="json",
     )
     try:
         payload = _parse_json_object(result.text)

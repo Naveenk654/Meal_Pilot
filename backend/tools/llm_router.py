@@ -57,14 +57,22 @@ async def _call_gemini(
     temperature: float,
     max_tokens: int,
     timeout_s: int,
+    response_format: str | None = None,
 ) -> LLMResult:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    generation_config: dict = {
+        "temperature": temperature,
+        "maxOutputTokens": max_tokens,
+    }
+    if response_format == "json":
+        # Without this, Gemini 2.0 Flash will often think-out-loud in prose
+        # ("We need to generate 4 distinct candidate plans...") instead of
+        # emitting the schema we asked for. Forcing the MIME type turns on
+        # Gemini's constrained-JSON decoding.
+        generation_config["responseMimeType"] = "application/json"
     body: dict = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": max_tokens,
-        },
+        "generationConfig": generation_config,
     }
     if system:
         body["systemInstruction"] = {"parts": [{"text": system}]}
@@ -96,18 +104,23 @@ async def _call_groq(
     temperature: float,
     max_tokens: int,
     timeout_s: int,
+    response_format: str | None = None,
 ) -> LLMResult:
     url = "https://api.groq.com/openai/v1/chat/completions"
     messages: list[dict] = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
-    body = {
+    body: dict = {
         "model": model,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if response_format == "json":
+        # Groq (OpenAI-compatible): require a well-formed JSON object. Prompt
+        # must still include the word "json" per OpenAI spec.
+        body["response_format"] = {"type": "json_object"}
     headers = {"Authorization": f"Bearer {api_key}"}
     started = asyncio.get_event_loop().time()
     try:
@@ -185,8 +198,15 @@ async def call_llm(
     temperature: float = 0.2,
     max_tokens: int = 1024,
     settings: Settings | None = None,
+    response_format: str | None = None,
 ) -> LLMResult:
     """§19 — the sole LLM entrypoint. Every agent tool call routes through here.
+
+    `response_format="json"` turns on provider-native JSON mode (Gemini
+    `responseMimeType`, Groq `response_format={"type":"json_object"}`). Without
+    it, Gemini 2.0 Flash in particular often returns prose "I need to..."
+    reasoning instead of the schema. Callers whose output must parse as JSON
+    (candidate_gen, menu_extract, pattern_detect) should pass "json".
 
     Deterministic (temperature=0) calls are cached in-process for `_CACHE_TTL_S`
     so repeated Generate clicks don't re-hit the provider."""
@@ -224,6 +244,7 @@ async def call_llm(
                     temperature=temperature,
                     max_tokens=max_tokens,
                     timeout_s=s.llm_request_timeout_s,
+                    response_format=response_format,
                 )
                 if key is not None:
                     _CACHE[key] = (_asyncio.get_event_loop().time(), result)
