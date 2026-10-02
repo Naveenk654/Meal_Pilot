@@ -117,9 +117,16 @@ async def _call_groq(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    if response_format == "json":
+    if response_format == "json" and not _is_groq_reasoning_model(model):
         # Groq (OpenAI-compatible): require a well-formed JSON object. Prompt
         # must still include the word "json" per OpenAI spec.
+        #
+        # Reasoning models (gpt-oss-*, qwen-thinking-*, deepseek-r1-*) emit
+        # their chain-of-thought in `reasoning` and only put the final answer
+        # in `content`. Groq's JSON validator checks `content` only, finds it
+        # empty, and 400s with `failed_generation: ""`. Skip JSON mode for
+        # these — the existing content/reasoning fallback below recovers the
+        # JSON string from wherever the model actually put it.
         body["response_format"] = {"type": "json_object"}
     headers = {"Authorization": f"Bearer {api_key}"}
     started = asyncio.get_event_loop().time()
@@ -145,6 +152,20 @@ async def _call_groq(
     return LLMResult(
         text=text, tokens_used=tokens, latency_ms=latency_ms, provider="groq", model=model
     )
+
+
+_GROQ_REASONING_PREFIXES = (
+    "openai/gpt-oss",
+    "qwen/qwen-thinking",
+    "deepseek-r1",
+)
+
+
+def _is_groq_reasoning_model(model: str) -> bool:
+    """Groq's reasoning models stream tokens into `reasoning` not `content`;
+    enabling JSON mode on them causes empty-content 400s. Detect by name."""
+    name = (model or "").lower()
+    return any(name.startswith(p) for p in _GROQ_REASONING_PREFIXES)
 
 
 def _raise_for_http_class(resp: httpx.Response, *, provider: str) -> None:
@@ -227,13 +248,20 @@ async def call_llm(
             if _asyncio.get_event_loop().time() - ts < _CACHE_TTL_S:
                 return result
 
-    last_error: Exception | None = None
+    # Collect every provider's final error so the trace shows BOTH primary and
+    # fallback failures. Previously only `last_error` was retained — meaning
+    # Gemini's failure got silently overwritten by Groq's, making the one that
+    # mattered invisible.
+    errors: list[tuple[str, str, Exception]] = []
+    skipped: list[str] = []
     for cfg in providers:
         if not cfg.api_key:
+            skipped.append(f"{cfg.provider}({cfg.model})=no_api_key")
             continue
         call = _PROVIDERS.get(cfg.provider)
         if call is None:
             raise LLMConfigError(f"Unknown LLM provider: {cfg.provider!r}")
+        provider_err: Exception | None = None
         for attempt in range(s.llm_max_retries):
             try:
                 result = await call(
@@ -250,14 +278,21 @@ async def call_llm(
                     _CACHE[key] = (_asyncio.get_event_loop().time(), result)
                 return result
             except LLMTransientError as exc:
-                last_error = exc
+                provider_err = exc
                 if attempt + 1 < s.llm_max_retries:
                     await asyncio.sleep(2 ** attempt)
                     continue
                 break  # exhausted retries on this provider → try fallback
             except LLMPermanentError as exc:
-                last_error = exc
+                provider_err = exc
                 break  # immediately try fallback
-    raise DegradedModeSignal(
-        f"primary and fallback LLMs unavailable; last_error={last_error!r}"
-    )
+        if provider_err is not None:
+            errors.append((cfg.provider, cfg.model, provider_err))
+
+    detail = "; ".join(
+        f"{prov}({model}): {type(exc).__name__}: {str(exc)[:300]}"
+        for prov, model, exc in errors
+    ) or "no providers attempted"
+    if skipped:
+        detail = f"skipped=[{', '.join(skipped)}]; " + detail
+    raise DegradedModeSignal(f"all LLMs unavailable — {detail}")
