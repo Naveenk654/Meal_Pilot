@@ -135,52 +135,68 @@ class ResolvedDailyMenu:
 
 
 def resolve_daily_menu(client: Client, *, on_date: date) -> ResolvedDailyMenu | None:
-    """Return today's items from the active cycle covering `on_date`, or None.
+    """Return today's items from the latest active cycle that has items for
+    today's day-of-week, or None.
 
-    None means "menu is uncertain" — the Planner must HITL or use safe fallback
-    (§12). We do NOT silently pick the most recent cycle regardless of dates.
+    Semantics: pick the active cycle with the LATEST `effective_from <= today`
+    that actually has `menu_items` for `on_date.weekday()`. `effective_to` is
+    intentionally ignored — mess menus stay in force until a newer one is
+    uploaded (admin manually sets status='superseded' to force-expire). An
+    empty cycle (e.g. a broken/partial ingestion, or a leaked test row) is
+    silently skipped so the next-newest cycle gets a chance.
+
+    None means "no cycle at all has items for today" — the Planner treats
+    that as menu-uncertain (§12 HITL / canteen fallback).
     """
     resp = (
         client.table("menu_cycles")
         .select("*")
         .lte("effective_from", on_date.isoformat())
-        .gte("effective_to", on_date.isoformat())
         .eq("status", "active")
+        .order("effective_from", desc=True)
         .order("version", desc=True)
-        .limit(1)
         .execute()
     )
-    rows = resp.data or []
-    if not rows:
+    cycles = resp.data or []
+    if not cycles:
         return None
-    cycle = rows[0]
     day_of_week = on_date.weekday()   # Monday=0
-    items_resp = (
-        client.table("menu_items")
-        .select("*")
-        .eq("cycle_id", cycle["id"])
-        .eq("day_of_week", day_of_week)
-        .execute()
-    )
-    items = [
-        ResolvedMenuItem(
-            day_of_week=day_of_week,
-            meal=MealSlot(row["meal"]),
-            dish_name=row["dish_name"],
-            dish_normalized=normalize_dish_name(row["dish_name"]),
-            is_veg=row["is_veg"],
-            macro_id=row["macro_id"],
-            confidence=float(row["confidence"]),
-            choice_group_id=row.get("choice_group_id"),
+
+    for cycle in cycles:
+        items_resp = (
+            client.table("menu_items")
+            .select("*")
+            .eq("cycle_id", cycle["id"])
+            .eq("day_of_week", day_of_week)
+            .execute()
         )
-        for row in (items_resp.data or [])
-    ]
-    return ResolvedDailyMenu(
-        cycle_id=cycle["id"],
-        effective_from=date.fromisoformat(cycle["effective_from"]),
-        effective_to=date.fromisoformat(cycle["effective_to"]),
-        version=int(cycle["version"]),
-        content_hash=cycle["content_hash"],
-        source=cycle["source"],
-        items=items,
-    )
+        rows = items_resp.data or []
+        if not rows:
+            # Empty cycle for this dow — skip and try the next-newest cycle.
+            # Covers broken ingestions and leaked test rows that would
+            # otherwise shadow a real menu.
+            continue
+        items = [
+            ResolvedMenuItem(
+                day_of_week=day_of_week,
+                meal=MealSlot(row["meal"]),
+                dish_name=row["dish_name"],
+                dish_normalized=normalize_dish_name(row["dish_name"]),
+                is_veg=row["is_veg"],
+                macro_id=row["macro_id"],
+                confidence=float(row["confidence"]),
+                choice_group_id=row.get("choice_group_id"),
+            )
+            for row in rows
+        ]
+        return ResolvedDailyMenu(
+            cycle_id=cycle["id"],
+            effective_from=date.fromisoformat(cycle["effective_from"]),
+            effective_to=date.fromisoformat(cycle["effective_to"]),
+            version=int(cycle["version"]),
+            content_hash=cycle["content_hash"],
+            source=cycle["source"],
+            items=items,
+        )
+    # No active cycle had any menu_items for today's day_of_week.
+    return None
